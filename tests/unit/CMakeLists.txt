@@ -62,6 +62,12 @@ add_executable(test_debug_log
 target_link_libraries(test_debug_log PRIVATE cvknxd_util GTest::gtest GTest::gtest_main)
 add_test(NAME test_debug_log COMMAND test_debug_log)
 
+add_executable(test_version
+    test_version.cpp
+)
+target_link_libraries(test_version PRIVATE cvknxd_version GTest::gtest GTest::gtest_main)
+add_test(NAME test_version COMMAND test_version)
+
 add_executable(test_fcgi_server
     test_fcgi_server.cpp
 )
