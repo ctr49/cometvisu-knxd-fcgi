@@ -65,6 +65,34 @@ std::optional<std::vector<uint8_t>> MockKnxdClient::cache_read(uint16_t group_ad
   return std::nullopt;
 }
 
+std::optional<LastUpdatesResult> MockKnxdClient::cache_last_updates_2(uint32_t start,
+                                                                      int /*timeout_sec*/) {
+  if (!connected_)
+    return std::nullopt;
+
+  // Return the first queued result that matches the start position,
+  // or the first result if no specific matching is configured.
+  if (last_updates_queue_.empty())
+    return std::nullopt;
+
+  auto state = last_updates_queue_.front();
+  last_updates_queue_.pop();
+
+  // If the test specified an after_position, only return if start matches
+  if (state.after_position != 0 && state.after_position != start) {
+    // Re-queue and return empty (no updates yet)
+    last_updates_queue_.push(state);
+    LastUpdatesResult empty;
+    empty.new_position = start;  // unchanged
+    return empty;
+  }
+
+  LastUpdatesResult result;
+  result.changed_addresses = state.changed_addrs;
+  result.new_position = state.new_position;
+  return result;
+}
+
 bool MockKnxdClient::poll_group_telegram(uint16_t& out_group_addr, std::vector<uint8_t>& out_apdu) {
   if (telegram_queue_.empty())
     return false;
@@ -72,11 +100,16 @@ bool MockKnxdClient::poll_group_telegram(uint16_t& out_group_addr, std::vector<u
   out_group_addr = front.first;
   out_apdu = front.second;
   telegram_queue_.pop();
+  telegram_count_++;
   return true;
 }
 
 int MockKnxdClient::get_fd() const {
   return -1;  // mock has no real fd
+}
+
+uint64_t MockKnxdClient::get_telegram_count() const {
+  return telegram_count_;
 }
 
 void MockKnxdClient::set_nonblocking(bool /*enable*/) {
@@ -100,6 +133,15 @@ void MockKnxdClient::reset() {
   while (!telegram_queue_.empty())
     telegram_queue_.pop();
   sent_packets_.clear();
+  telegram_count_ = 0;
+  while (!last_updates_queue_.empty())
+    last_updates_queue_.pop();
+}
+
+void MockKnxdClient::set_last_updates_result(uint32_t after_position,
+                                             const std::vector<uint16_t>& changed_addrs,
+                                             uint32_t new_position) {
+  last_updates_queue_.push({after_position, changed_addrs, new_position});
 }
 
 }  // namespace cvknxd

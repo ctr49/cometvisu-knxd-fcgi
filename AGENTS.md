@@ -140,8 +140,8 @@ The eibd client protocol over Unix socket:
 | `EIB_GROUP_PACKET`      | `0x0027` | Send group telegram            |
 | `EIB_APDU_PACKET`       | `0x0025` | Received group telegram        |
 | `EIB_OPEN_T_GROUP`      | `0x0022` | Open T_Group (for read)        |
-| `EIB_CACHE_READ`        | `0x0200` | Read from group cache          |
-| `EIB_CACHE_READ_NOWAIT` | `0x0201` | Read from group cache (no wait)|
+| `EIB_CACHE_READ`        | `0x0074` | Read from group cache          |
+| `EIB_CACHE_READ_NOWAIT` | `0x0075` | Read from group cache (no wait)|
 
 ### Group Address Format
 KNX three-level address `X/Y/Z` → 16-bit:
@@ -174,8 +174,17 @@ Response: empty success or error message.
 
 ### Receiving a Group Packet (EIB_APDU_PACKET)
 ```
-[0x00 0x25] [src_addr_hi] [src_addr_lo] [APDU bytes...]
+[0x00 0x25] [src_pa_hi] [src_pa_lo] [dst_ga_hi] [dst_ga_lo] [APDU bytes...]
 ```
+Note: The destination group address (dst_ga) is at offset 2-3 of the payload
+(after the 2-byte type), NOT at offset 0-1 (which is the source physical address).
+
+### Cache Read Response (EIB_CACHE_READ / EIB_CACHE_READ_NOWAIT)
+```
+[type:2] [src:2] [dst:2] [apdu_data...]
+```
+- Cache hit: payload size >= 6 (src + dst + at least 2 APDU bytes)
+- Cache miss: payload size == 4 (src + dst only, no APDU data)
 
 ## APDU Decoding
 

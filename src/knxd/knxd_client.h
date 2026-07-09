@@ -22,6 +22,8 @@
 #include <string_view>
 #include <vector>
 
+#include "knxd_protocol.h"
+
 namespace cvknxd {
 
 /// Interface for knxd communication — allows mocking in tests.
@@ -62,6 +64,16 @@ public:
   [[nodiscard]] virtual std::optional<std::vector<uint8_t>> cache_read(uint16_t group_addr,
                                                                        bool nowait) = 0;
 
+  /// Query knxd for group addresses that changed since a given position.
+  /// This is the COMET/long-poll primitive — it blocks until updates arrive
+  /// or the timeout expires (like the original EIB_Cache_LastUpdates).
+  /// Uses the EIB_CACHE_LAST_UPDATES_2 protocol message with 32-bit counters.
+  /// @param start The starting position (only updates after this are returned).
+  /// @param timeout_sec How long to wait for updates (seconds, 0 = return immediately).
+  /// @return LastUpdatesResult with changed addresses and new position, or std::nullopt on error.
+  [[nodiscard]] virtual std::optional<LastUpdatesResult> cache_last_updates_2(uint32_t start,
+                                                                              int timeout_sec) = 0;
+
   /// Try to receive a group telegram (non-blocking).
   /// @param out_group_addr Output: source of the telegram.
   /// @param out_apdu Output: received APDU bytes.
@@ -72,6 +84,10 @@ public:
   /// Get the underlying file descriptor for poll()/select() integration.
   /// Returns -1 if not connected.
   [[nodiscard]] virtual int get_fd() const = 0;
+
+  /// Get the total number of group telegrams received from the knxd bus.
+  /// This is used as the "i" (index/state-version) field in CometVisu responses.
+  [[nodiscard]] virtual uint64_t get_telegram_count() const = 0;
 
   /// Set the socket to non-blocking mode.
   virtual void set_nonblocking(bool enable) = 0;
@@ -98,14 +114,21 @@ public:
                                        const std::vector<uint8_t>& apdu) override;
   [[nodiscard]] std::optional<std::vector<uint8_t>> cache_read(uint16_t group_addr,
                                                                bool nowait) override;
+  [[nodiscard]] std::optional<LastUpdatesResult> cache_last_updates_2(uint32_t start,
+                                                                      int timeout_sec) override;
   [[nodiscard]] bool poll_group_telegram(uint16_t& out_group_addr,
                                          std::vector<uint8_t>& out_apdu) override;
   [[nodiscard]] int get_fd() const override;
+  [[nodiscard]] uint64_t get_telegram_count() const override;
   void set_nonblocking(bool enable) override;
 
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+
+  /// Ensure the cache connection is open (lazy initialization).
+  /// Returns pointer to the cache fd, or nullptr on failure.
+  [[nodiscard]] int* ensure_cache_connection();
 };
 
 }  // namespace cvknxd

@@ -41,6 +41,18 @@ if [ "$QUERY_PART" = "$TARGET" ]; then
   QUERY_PART=""
 fi
 
+# For GET/HEAD requests, merge body into the query string (the body is
+# sent via stdin to cgi-fcgi, but FCGI only passes QUERY_STRING to the
+# application for GET — the body is effectively discarded).
+if [ "$METHOD" = "GET" ] || [ "$METHOD" = "HEAD" ]; then
+  if [ -n "$BODY" ] && [ -n "$QUERY_PART" ]; then
+    QUERY_PART="${QUERY_PART}&${BODY}"
+  elif [ -n "$BODY" ]; then
+    QUERY_PART="$BODY"
+  fi
+  BODY=""
+fi
+
 CONTENT_LENGTH="${#BODY}"
 
 export REQUEST_METHOD="$METHOD"

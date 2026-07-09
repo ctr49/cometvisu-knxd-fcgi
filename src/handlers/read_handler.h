@@ -52,9 +52,7 @@ private:
   KnxdClientInterface& knxd_;
   SessionStore& sessions_;
   int longpoll_timeout_sec_;
-  uint64_t index_counter_ = 1;
 
-  [[nodiscard]] std::string generate_index();
   [[nodiscard]] static std::optional<int> parse_timeout(std::string_view t_str);
 };
 

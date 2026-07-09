@@ -236,4 +236,41 @@ std::vector<uint8_t> build_cache_read_nowait(uint16_t group_addr) {
                                                     static_cast<uint8_t>(group_addr & 0xFF)});
 }
 
+std::vector<uint8_t> build_cache_last_updates_2(uint32_t start, int timeout_sec) {
+  // Payload: [type:2][start:4][timeout:2]
+  std::vector<uint8_t> data;
+  data.reserve(6);
+  data.push_back(static_cast<uint8_t>((start >> 24) & 0xFF));
+  data.push_back(static_cast<uint8_t>((start >> 16) & 0xFF));
+  data.push_back(static_cast<uint8_t>((start >> 8) & 0xFF));
+  data.push_back(static_cast<uint8_t>(start & 0xFF));
+  data.push_back(static_cast<uint8_t>((timeout_sec >> 8) & 0xFF));
+  data.push_back(static_cast<uint8_t>(timeout_sec & 0xFF));
+  return build_eibd_message(EIB_CACHE_LAST_UPDATES_2, data);
+}
+
+std::optional<LastUpdatesResult> parse_cache_last_updates_2_response(
+    const std::vector<uint8_t>& data) {
+  // Response payload: [end:4][addrs:N*2]
+  if (data.size() < 4)
+    return std::nullopt;
+
+  LastUpdatesResult result;
+  result.new_position = (static_cast<uint32_t>(data[0]) << 24) |
+                        (static_cast<uint32_t>(data[1]) << 16) |
+                        (static_cast<uint32_t>(data[2]) << 8) | static_cast<uint32_t>(data[3]);
+
+  // Remaining bytes are pairs of group addresses
+  size_t remaining = data.size() - 4;
+  if (remaining % 2 != 0)
+    return std::nullopt;  // must be even number of bytes
+
+  for (size_t i = 4; i < data.size(); i += 2) {
+    uint16_t addr = (static_cast<uint16_t>(data[i]) << 8) | static_cast<uint16_t>(data[i + 1]);
+    result.changed_addresses.push_back(addr);
+  }
+
+  return result;
+}
+
 }  // namespace cvknxd
