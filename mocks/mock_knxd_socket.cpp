@@ -60,6 +60,7 @@ std::optional<std::vector<uint8_t>> MockKnxdClient::cache_read(uint16_t group_ad
     return std::nullopt;
   if (cache_read_fail_count_ > 0) {
     cache_read_fail_count_--;
+    connected_ = false;
     return std::nullopt;
   }
   auto it = cached_values_.find(group_addr);
@@ -74,9 +75,12 @@ std::optional<LastUpdatesResult> MockKnxdClient::cache_last_updates_2(uint32_t s
   if (!connected_)
     return std::nullopt;
 
-  // Simulate connection failures for testing reconnection resilience
+  // Simulate connection failures for testing reconnection resilience.
+  // Set connected_=false so the handler can detect the failure via is_connected()
+  // and trigger a reconnect().
   if (cache_updates_fail_count_ > 0) {
     cache_updates_fail_count_--;
+    connected_ = false;
     return std::nullopt;
   }
 

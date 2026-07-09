@@ -406,6 +406,11 @@ std::optional<std::vector<uint8_t>> KnxdClient::cache_read(uint16_t group_addr, 
     if (cache_fd == nullptr)
       return std::nullopt;  // can't connect at all — retryable
 
+    // Clear any residual data from previous cache operations (e.g.
+    // cache_last_updates_2) that share this buffer. Without this,
+    // stale response fragments corrupt the parsing of our response.
+    impl_->cache_read_buffer_.clear();
+
     auto addr_str = KnxGroupAddress::from_eibaddr(group_addr).to_string();
 
     DebugLog::knxd_send("cache_read", addr_str, nowait ? "nowait=true" : "nowait=false");

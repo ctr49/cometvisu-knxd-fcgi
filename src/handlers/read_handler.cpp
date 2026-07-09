@@ -171,19 +171,33 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
     // The KnxdClient implementation handles internal reconnection transparently,
     // but if knxd is still down after the internal retry, we attempt a full
     // reconnect here and continue the loop with the remaining time budget.
+    auto call_start = std::chrono::steady_clock::now();
     auto updates = knxd_.cache_last_updates_2(lastpos, remaining);
     if (!updates.has_value()) {
-      // Could be timeout (normal) or persistent connection error.
-      // If we still have time left, try a full reconnect and continue.
-      auto now = std::chrono::steady_clock::now();
-      auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(now - tstart).count();
-      if (elapsed_sec < timeout_sec && (timeout_sec - elapsed_sec) > 1) {
-        knxd_.reconnect();  // best-effort; will be used on next iteration
-        // Brief pause to avoid busy-looping if knxd is still restarting
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        continue;
+      // cache_last_updates_2 can return nullopt for three reasons:
+      // 1. No pending updates (returns immediately) — break normally.
+      // 2. Connection error — reconnect and retry if time remains.
+      // 3. Timeout (blocks for remaining time) — break normally.
+      //
+      // Distinguish by checking connection health and call duration.
+      auto call_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - call_start)
+                                 .count();
+
+      if (!knxd_.is_connected()) {
+        // Connection is dead — reconnect and retry if time remains
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(now - tstart).count();
+        if (elapsed_sec < timeout_sec && (timeout_sec - elapsed_sec) > 1) {
+          knxd_.reconnect();
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+          continue;
+        }
       }
-      break;  // timeout exhausted, exit normally
+
+      // Connection is alive — either immediate "no data" or legitimate timeout.
+      // In either case, there's nothing to wait for; exit the poll loop.
+      break;
     }
 
     uint32_t prev_lastpos = lastpos;
@@ -210,24 +224,26 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
       break;
 
     // Guard against busy-loop: if no progress was made (position didn't
-    // advance and no changes found), the knxd server returned immediately.
-    // In the original, EIB_Cache_LastUpdates would block for the full
-    // timeout. We simulate the same: wait for the remaining time.
+    // advance and no changes found), knxd's internal timeout (~1s) expired
+    // with no updates. Continue polling — don't sleep-and-break, because
+    // a telegram could arrive at any moment. The outer while loop handles
+    // the overall timeout via elapsed/remaining calculation.
     if (lastpos == prev_lastpos && updates->changed_addresses.empty()) {
-      // No progress — wait the remaining time before trying again
-      auto now = std::chrono::steady_clock::now();
-      auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              tstart + std::chrono::seconds(timeout_sec) - now)
-                              .count();
-      if (remaining_ms <= 0)
-        break;
-      // Sleep in small increments to remain responsive
-      while (remaining_ms > 0) {
-        int chunk = static_cast<int>(std::min<int64_t>(remaining_ms, 100));
-        std::this_thread::sleep_for(std::chrono::milliseconds(chunk));
-        remaining_ms -= chunk;
-      }
-      break;  // timeout expired after waiting
+      // knxd returns "no updates" after its internal ~1s timeout.
+      // Just continue the poll loop — the next cache_last_updates_2
+      // call will either return new updates or time out again.
+      continue;
+    }
+
+    // Guard against busy-loop on a busy bus: if the position advanced due
+    // to telegrams for non-subscribed addresses, cache_last_updates_2
+    // returns immediately on every call, causing a tight CPU-spinning loop.
+    // A brief pause lets the bus settle and keeps us responsive.
+    if (lastpos != prev_lastpos && !updates->changed_addresses.empty()) {
+      // Position advanced but our addresses didn't change.
+      // Sleep briefly to avoid CPU spinning, then continue polling
+      // with the updated position.
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
 

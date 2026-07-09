@@ -248,6 +248,81 @@ TEST_F(ReadHandlerTest, InvalidAddressIgnored) {
   EXPECT_NE(result.body.find("KNX:1/2/3"), std::string::npos);
 }
 
+// Verifies that a long-poll with a non-zero index (i= parameter) detects
+// pending updates that were sent before the poll started.
+// This is the exact scenario: user sends packets, then starts long-poll
+// with i=<old_index>. The handler must detect the pending updates via
+// cache_last_updates_2 and return the cached value.
+TEST_F(ReadHandlerTest, LongPollWithIndexDetectsPendingUpdate) {
+  ReadHandler handler(knxd_, sessions_);
+
+  // Simulate: packets were sent to 1/2/3 while the client was away.
+  // The client comes back with i=5 (the last index it saw).
+  // cache_last_updates_2 should return the GA as changed.
+  knxd_.set_last_updates_result(5, {0x0A03}, 10);
+  knxd_.set_cached_value(0x0A03, {0x42});
+
+  auto result = handler.handle("a=KNX:1/2/3&i=5");
+
+  EXPECT_EQ(result.http_status, 200);
+  EXPECT_NE(result.body.find("KNX:1/2/3"), std::string::npos);
+  EXPECT_NE(result.body.find("42"), std::string::npos);
+  // Index must advance to the new position from cache_last_updates_2
+  EXPECT_NE(result.body.find("\"i\":\"10\""), std::string::npos);
+}
+
+// Simulates a busy KNX bus where cache_last_updates_2 returns immediately
+// with telegrams for non-subscribed addresses, then eventually returns
+// the subscribed address. The handler must skip non-matching addresses
+// and still detect the matching one — without CPU-spinning.
+TEST_F(ReadHandlerTest, LongPollWithIndexSkipsNonMatchingThenFindsMatch) {
+  ReadHandler handler(knxd_, sessions_);
+
+  // First call: non-matching address only (busy bus telegram)
+  knxd_.set_last_updates_result(5, {0x0B04}, 7);
+  // Second call: the matching address arrives
+  knxd_.set_last_updates_result(7, {0x0A03}, 10);
+
+  // Cache values for both addresses
+  knxd_.set_cached_value(0x0B04, {0x0C, 0x6F});
+  knxd_.set_cached_value(0x0A03, {0x42});
+
+  // Long-poll subscribed only to 1/2/3
+  auto result = handler.handle("a=KNX:1/2/3&i=5");
+
+  EXPECT_EQ(result.http_status, 200);
+  // Must include the matching address (1/2/3 = 0x0A03)
+  EXPECT_NE(result.body.find("KNX:1/2/3"), std::string::npos);
+  EXPECT_NE(result.body.find("42"), std::string::npos);
+  // Non-matching address must NOT appear
+  EXPECT_EQ(result.body.find("KNX:1/3/4"), std::string::npos);
+  // Index must advance to the final position
+  EXPECT_NE(result.body.find("\"i\":\"10\""), std::string::npos);
+}
+
+// Simulates knxd's CACHE_LAST_UPDATES_2 returning "no updates" (changed=0,
+// position unchanged) because knxd has an internal ~1s timeout. The handler
+// must NOT sleep-and-break on this response — it must continue polling so
+// that a subsequent telegram is detected.
+TEST_F(ReadHandlerTest, LongPollContinuesPollingAfterKnxdEmptyResponse) {
+  ReadHandler handler(knxd_, sessions_);
+
+  // First call: knxd returns "no updates" (changed=0, position unchanged)
+  // after=0 means this matches any start position
+  knxd_.set_last_updates_result(0, {}, 11028);
+  // Second call: a telegram for our GA finally arrives
+  knxd_.set_last_updates_result(11028, {0x0A03}, 11029);
+  knxd_.set_cached_value(0x0A03, {0x42});
+
+  // Long-poll with i=11028, no t (default timeout)
+  auto result = handler.handle("a=KNX:1/2/3&i=11028");
+
+  EXPECT_EQ(result.http_status, 200);
+  EXPECT_NE(result.body.find("KNX:1/2/3"), std::string::npos);
+  EXPECT_NE(result.body.find("42"), std::string::npos);
+  EXPECT_NE(result.body.find("\"i\":\"11029\""), std::string::npos);
+}
+
 TEST_F(ReadHandlerTest, RecoversFromCacheUpdatesFailure) {
   // Simulates knxd restart: cache_last_updates_2 fails once, then
   // succeeds after the handler calls reconnect().
