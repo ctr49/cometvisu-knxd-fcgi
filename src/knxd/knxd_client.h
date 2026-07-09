@@ -129,6 +129,9 @@ private:
   /// Ensure the cache connection is open (lazy initialization).
   /// Returns pointer to the cache fd, or nullptr on failure.
   [[nodiscard]] int* ensure_cache_connection();
+
+  /// Close the cache connection so the next cache operation will reconnect.
+  void invalidate_cache();
 };
 
 }  // namespace cvknxd

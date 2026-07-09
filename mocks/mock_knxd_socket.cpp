@@ -58,6 +58,10 @@ std::optional<std::vector<uint8_t>> MockKnxdClient::cache_read(uint16_t group_ad
                                                                bool /*nowait*/) {
   if (!connected_)
     return std::nullopt;
+  if (cache_read_fail_count_ > 0) {
+    cache_read_fail_count_--;
+    return std::nullopt;
+  }
   auto it = cached_values_.find(group_addr);
   if (it != cached_values_.end()) {
     return it->second;
@@ -69,6 +73,12 @@ std::optional<LastUpdatesResult> MockKnxdClient::cache_last_updates_2(uint32_t s
                                                                       int /*timeout_sec*/) {
   if (!connected_)
     return std::nullopt;
+
+  // Simulate connection failures for testing reconnection resilience
+  if (cache_updates_fail_count_ > 0) {
+    cache_updates_fail_count_--;
+    return std::nullopt;
+  }
 
   // Return the first queued result that matches the start position,
   // or the first result if no specific matching is configured.
@@ -136,6 +146,8 @@ void MockKnxdClient::reset() {
   telegram_count_ = 0;
   while (!last_updates_queue_.empty())
     last_updates_queue_.pop();
+  cache_updates_fail_count_ = 0;
+  cache_read_fail_count_ = 0;
 }
 
 void MockKnxdClient::set_last_updates_result(uint32_t after_position,

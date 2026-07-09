@@ -79,6 +79,14 @@ public:
   void set_last_updates_result(uint32_t after_position, const std::vector<uint16_t>& changed_addrs,
                                uint32_t new_position);
 
+  /// Make the next N calls to cache_last_updates_2 return std::nullopt
+  /// (simulating connection loss / knxd restart).
+  void set_cache_last_updates_fail_count(int count) { cache_updates_fail_count_ = count; }
+
+  /// Make the next N calls to cache_read return std::nullopt
+  /// (simulating connection loss / knxd restart).
+  void set_cache_read_fail_count(int count) { cache_read_fail_count_ = count; }
+
 private:
   bool connected_ = false;
   bool group_socket_open_ = false;
@@ -96,6 +104,10 @@ private:
     uint32_t new_position;
   };
   std::queue<LastUpdatesState> last_updates_queue_;
+
+  // Fail-count controls for testing reconnection resilience
+  int cache_updates_fail_count_ = 0;
+  int cache_read_fail_count_ = 0;
 };
 
 }  // namespace cvknxd

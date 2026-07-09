@@ -168,9 +168,22 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
     // Use cache_last_updates_2 for position-based polling.
     // This is the equivalent of the original EIB_Cache_LastUpdates().
     // The original blocks for the full timeout if no updates are available.
+    // The KnxdClient implementation handles internal reconnection transparently,
+    // but if knxd is still down after the internal retry, we attempt a full
+    // reconnect here and continue the loop with the remaining time budget.
     auto updates = knxd_.cache_last_updates_2(lastpos, remaining);
     if (!updates.has_value()) {
-      break;  // error or timeout
+      // Could be timeout (normal) or persistent connection error.
+      // If we still have time left, try a full reconnect and continue.
+      auto now = std::chrono::steady_clock::now();
+      auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(now - tstart).count();
+      if (elapsed_sec < timeout_sec && (timeout_sec - elapsed_sec) > 1) {
+        knxd_.reconnect();  // best-effort; will be used on next iteration
+        // Brief pause to avoid busy-looping if knxd is still restarting
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+      break;  // timeout exhausted, exit normally
     }
 
     uint32_t prev_lastpos = lastpos;

@@ -248,6 +248,62 @@ TEST_F(ReadHandlerTest, InvalidAddressIgnored) {
   EXPECT_NE(result.body.find("KNX:1/2/3"), std::string::npos);
 }
 
+TEST_F(ReadHandlerTest, RecoversFromCacheUpdatesFailure) {
+  // Simulates knxd restart: cache_last_updates_2 fails once, then
+  // succeeds after the handler calls reconnect().
+  ReadHandler handler(knxd_, sessions_);
+
+  // First call to cache_last_updates_2 will fail (return nullopt)
+  knxd_.set_cache_last_updates_fail_count(1);
+  // After reconnect, the second call will succeed
+  knxd_.set_last_updates_result(0, {0x0A03}, 10);
+  knxd_.set_cached_value(0x0A03, {0x42});
+
+  auto result = handler.handle("a=KNX:1/2/3&t=30");
+
+  EXPECT_EQ(result.http_status, 200);
+  EXPECT_NE(result.body.find("KNX:1/2/3"), std::string::npos);
+  EXPECT_NE(result.body.find("42"), std::string::npos);
+  EXPECT_NE(result.body.find("\"i\":\"10\""), std::string::npos);
+}
+
+TEST_F(ReadHandlerTest, RecoversFromCacheReadFailureInPollLoop) {
+  // Simulates knxd restart during the cache_read that follows a successful
+  // cache_last_updates_2.
+  ReadHandler handler(knxd_, sessions_);
+
+  // cache_last_updates_2 succeeds, returning changed address
+  knxd_.set_last_updates_result(0, {0x0A03}, 10);
+  // But cache_read for that address fails on the first attempt
+  knxd_.set_cache_read_fail_count(1);
+  // The second cache_read succeeds (after internal reconnect in KnxdClient)
+  knxd_.set_cached_value(0x0A03, {0x42});
+
+  auto result = handler.handle("a=KNX:1/2/3&t=30");
+
+  EXPECT_EQ(result.http_status, 200);
+  EXPECT_NE(result.body.find("KNX:1/2/3"), std::string::npos);
+  // The cache_read retry in KnxdClient should recover the value
+  EXPECT_NE(result.body.find("42"), std::string::npos);
+}
+
+TEST_F(ReadHandlerTest, HandlesPersistentKnxdOutage) {
+  // Simulates knxd being permanently down: cache_last_updates_2 always fails.
+  // The handler should eventually return a valid response (empty data + index)
+  // rather than crashing or hanging.
+  ReadHandler handler(knxd_, sessions_);
+
+  // All cache_last_updates_2 calls fail
+  knxd_.set_cache_last_updates_fail_count(100);
+
+  auto result = handler.handle("a=KNX:1/2/3&t=1");
+
+  EXPECT_EQ(result.http_status, 200);
+  // Should have empty data object and an index
+  EXPECT_NE(result.body.find("\"d\":{}"), std::string::npos);
+  EXPECT_NE(result.body.find("\"i\":\""), std::string::npos);
+}
+
 TEST_F(ReadHandlerTest, InvalidTimeoutReturns400) {
   ReadHandler handler(knxd_, sessions_);
   auto result = handler.handle("a=KNX:1/2/3&t=abc");
