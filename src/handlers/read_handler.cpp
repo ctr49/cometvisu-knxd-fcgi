@@ -15,16 +15,13 @@
 
 #include "read_handler.h"
 
-#include <poll.h>
-
-#include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "knxd/knxd_client.h"
@@ -39,10 +36,6 @@ namespace cvknxd {
 ReadHandler::ReadHandler(KnxdClientInterface& knxd, SessionStore& sessions,
                          int longpoll_timeout_sec)
     : knxd_(knxd), sessions_(sessions), longpoll_timeout_sec_(longpoll_timeout_sec) {}
-
-std::string ReadHandler::generate_index() {
-  return std::to_string(index_counter_++);
-}
 
 std::optional<int> ReadHandler::parse_timeout(std::string_view t_str) {
   if (t_str.empty()) {
@@ -64,7 +57,7 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
   const QueryString params{query_string};
   ReadResult result;
 
-  // ---- Get addresses first (before session check, so 400 takes priority) ----
+  // ---- Get addresses first (before anything else, so 400 takes priority) ----
   auto addresses = params.get_all("a");
   if (addresses.empty()) {
     result.http_status = 400;
@@ -81,18 +74,40 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
     }
   }
 
-  // ---- Parse timeout ----
-  std::optional<int> timeout;
+  // ---- Parse timeout (t parameter) ----
+  // Original semantics: t is a simple timeout in seconds for the poll loop.
+  // If t is not specified, use the default longpoll timeout.
+  // If t == 0: force initial read (lastpos=0) and set timeout to 1 second.
+  int timeout_sec = longpoll_timeout_sec_;
   if (auto t_opt = params.get("t")) {
-    timeout = parse_timeout(*t_opt);
-    if (!timeout.has_value()) {
+    auto parsed = parse_timeout(*t_opt);
+    if (!parsed.has_value()) {
       result.http_status = 400;
       result.body = "{}";
       return result;
     }
+    timeout_sec = *parsed;
   }
 
-  // ---- Collect EIB addresses ----
+  // ---- Parse position (i parameter) ----
+  // i is the last known position (like "lastpos" in the original).
+  // 0 means the client has no prior state.
+  uint32_t lastpos = 0;
+  if (auto i_opt = params.get("i")) {
+    auto parsed = parse_timeout(*i_opt);  // reuse int parser
+    if (parsed.has_value() && *parsed >= 0) {
+      lastpos = static_cast<uint32_t>(*parsed);
+    }
+    // Invalid i is ignored (not an error)
+  }
+
+  // ---- t=0 special handling: force initial read ----
+  if (timeout_sec == 0) {
+    lastpos = 0;
+    timeout_sec = 1;
+  }
+
+  // ---- Collect EIB addresses and build lookup set ----
   std::set<uint16_t> eib_addrs;
   for (auto addr_str : addresses) {
     auto parsed = KnxAddress::from_cometvisu(addr_str);
@@ -107,202 +122,136 @@ ReadResult ReadHandler::handle(std::string_view query_string) {
     return result;
   }
 
-  // ---- Decide: COMET poll, cache-only, or cache-then-COMET ----
-  bool do_comet_poll = false;
+  // Helper: build the key for an address in the JSON response.
+  auto addr_key = [](uint16_t eib_addr) -> std::string {
+    return KnxAddress{"KNX", KnxGroupAddress::from_eibaddr(eib_addr)}.to_cometvisu();
+  };
 
-  if (!timeout.has_value()) {
-    // No t parameter → pure COMET: block until telegram or longpoll timeout.
-    do_comet_poll = true;
-  } else {
-    const int t_val = *timeout;
+  JsonBuilder json;
+  json.start_object();
+  json.add_key("d");
+  json.start_object();
+  bool written = false;
 
-    if (t_val < 0) {
-      // ---- t < 0: cache-only, non-blocking, always returns 200 ----
-      JsonBuilder json;
-      json.start_object();
-      json.add_key("d");
-      json.start_object();
+  // Track which addresses we've already included (deduplication).
+  std::set<uint16_t> already_written;
 
-      for (auto addr : eib_addrs) {
-        auto data = knxd_.cache_read(addr, true);  // nowait
-        if (data) {
-          auto cv_addr = KnxAddress{"KNX", KnxGroupAddress::from_eibaddr(addr)};
-          json.add_string(cv_addr.to_cometvisu(), hex_encode(data->data(), data->size()));
-        }
-      }
-
-      json.end_object();
-      json.add_string("i", generate_index());
-      json.end_object();
-      result.body = json.take();
-      return result;
-    }
-
-    if (t_val == 0) {
-      // ---- t == 0: immediate response — return cached values, send reads for uncached ----
-      JsonBuilder json;
-      json.start_object();
-      json.add_key("d");
-      json.start_object();
-
-      for (auto addr : eib_addrs) {
-        auto data = knxd_.cache_read(addr, true);  // nowait: non-blocking
-        if (data) {
-          auto cv_addr = KnxAddress{"KNX", KnxGroupAddress::from_eibaddr(addr)};
-          json.add_string(cv_addr.to_cometvisu(), hex_encode(data->data(), data->size()));
-        } else {
-          // Not in cache — send a read telegram to request the value from the bus
-          auto read_apdu = build_apdu(ApduType::Read, {});
-          knxd_.send_group_packet(addr, read_apdu);
-        }
-      }
-
-      json.end_object();
-      json.add_string("i", generate_index());
-      json.end_object();
-      result.body = json.take();
-      return result;
-    }
-
-    // ---- t > 0: data freshness timeout — first try cache ----
-    // t defines how old the cached data may be (not a connection timeout).
-    // The connection always uses the generic longpoll_timeout for blocking.
-    JsonBuilder json;
-    json.start_object();
-    json.add_key("d");
-    json.start_object();
-    bool any_found = false;
-
+  // ---- Initial read (if lastpos == 0) ----
+  // Reads ALL requested addresses from the knxd cache synchronously.
+  // This matches the original: for (i = 0; i < UINT16; i++) { if (subscribed) { ... } }
+  if (lastpos == 0) {
     for (auto addr : eib_addrs) {
-      auto data = knxd_.cache_read(addr, true);  // nowait
+      auto data = knxd_.cache_read(addr, true);  // nowait (cache_read filters out Read APDUs)
       if (data) {
-        auto cv_addr = KnxAddress{"KNX", KnxGroupAddress::from_eibaddr(addr)};
-        json.add_string(cv_addr.to_cometvisu(), hex_encode(data->data(), data->size()));
-        any_found = true;
+        json.add_string(addr_key(addr), hex_encode(data->data(), data->size()));
+        already_written.insert(addr);
+        written = true;
       }
     }
-
-    json.end_object();
-    json.add_string("i", generate_index());
-    json.end_object();
-
-    if (any_found) {
-      result.body = json.take();
-      return result;
-    }
-
-    // Cache miss — fall through to COMET poll.
-    do_comet_poll = true;
   }
 
-  // ---- COMET poll (shared by pure COMET and t>=0 cache-miss) ----
-  if (do_comet_poll) {
-    // ---- Drain any telegrams already buffered ----
-    // These may have arrived during open_group_socket() or previous cache_read()
-    // calls and sit in the application-level read buffer, invisible to poll().
-    {
-      uint16_t recv_addr = 0;
-      std::vector<uint8_t> apdu_data;
-      while (knxd_.poll_group_telegram(recv_addr, apdu_data)) {
-        if (eib_addrs.find(recv_addr) != eib_addrs.end()) {
-          JsonBuilder resp;
-          resp.start_object();
-          resp.add_key("d");
-          resp.start_object();
-          auto cv_addr = KnxAddress{"KNX", KnxGroupAddress::from_eibaddr(recv_addr)};
-          resp.add_string(cv_addr.to_cometvisu(), hex_encode(apdu_data.data(), apdu_data.size()));
-          resp.end_object();
-          resp.add_string("i", generate_index());
-          resp.end_object();
-          result.body = resp.take();
-          return result;
-        }
-      }
-    }
+  // ---- Poll loop (COMET/long-poll) ----
+  // Original: while ((!written || lastpos < 1) && difftime(time(NULL), tstart) < timeout)
+  // - Continue while nothing written OR this was an initial request
+  // - Stop when timeout elapses
+  auto tstart = std::chrono::steady_clock::now();
 
-    // ---- Check if we have a real socket fd for poll() ----
-    const int knxd_fd = knxd_.get_fd();
-    if (knxd_fd < 0) {
-      // No real fd (e.g., mock): buffered data already drained above,
-      // no match found — return empty immediately.
-      JsonBuilder resp;
-      resp.start_object();
-      resp.add_key("d");
-      resp.start_object();
-      resp.end_object();
-      resp.add_string("i", generate_index());
-      resp.end_object();
-      result.body = resp.take();
-      return result;
-    }
+  while ((!written || lastpos < 1) && timeout_sec > 0) {
+    // Calculate remaining time
+    auto elapsed =
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - tstart)
+            .count();
+    int remaining = timeout_sec - static_cast<int>(elapsed);
+    if (remaining <= 0)
+      break;
 
-    // ---- Efficient poll-based wait on knxd socket ----
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(longpoll_timeout_sec_);
+    // Use cache_last_updates_2 for position-based polling.
+    // This is the equivalent of the original EIB_Cache_LastUpdates().
+    // The original blocks for the full timeout if no updates are available.
+    // The KnxdClient implementation handles internal reconnection transparently,
+    // but if knxd is still down after the internal retry, we attempt a full
+    // reconnect here and continue the loop with the remaining time budget.
+    auto call_start = std::chrono::steady_clock::now();
+    auto updates = knxd_.cache_last_updates_2(lastpos, remaining);
+    if (!updates.has_value()) {
+      // cache_last_updates_2 can return nullopt for three reasons:
+      // 1. No pending updates (returns immediately) — break normally.
+      // 2. Connection error — reconnect and retry if time remains.
+      // 3. Timeout (blocks for remaining time) — break normally.
+      //
+      // Distinguish by checking connection health and call duration.
+      auto call_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - call_start)
+                                 .count();
 
-    while (true) {
-      auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           deadline - std::chrono::steady_clock::now())
-                           .count();
-      if (remaining <= 0)
-        break;  // timeout
-
-      struct pollfd pfd = {};
-      pfd.fd = knxd_fd;
-      pfd.events = POLLIN;
-      pfd.revents = 0;
-
-      int poll_ret = ::poll(&pfd, 1, static_cast<int>(remaining));
-      if (poll_ret < 0) {
-        if (errno == EINTR) {
+      if (!knxd_.is_connected()) {
+        // Connection is dead — reconnect and retry if time remains
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(now - tstart).count();
+        if (elapsed_sec < timeout_sec && (timeout_sec - elapsed_sec) > 1) {
+          knxd_.reconnect();
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
           continue;
         }
-        break;  // error
-      }
-      if (poll_ret == 0) {
-        break;  // timeout
       }
 
-      // Check for hangup or error before processing data
-      if ((pfd.revents & (POLLHUP | POLLERR)) != 0) {
-        break;
-      }
+      // Connection is alive — either immediate "no data" or legitimate timeout.
+      // In either case, there's nothing to wait for; exit the poll loop.
+      break;
+    }
 
-      if ((pfd.revents & POLLIN) != 0) {
-        uint16_t recv_addr = 0;
-        std::vector<uint8_t> apdu_data;
+    uint32_t prev_lastpos = lastpos;
+    lastpos = updates->new_position;
 
-        while (knxd_.poll_group_telegram(recv_addr, apdu_data)) {
-          if (eib_addrs.find(recv_addr) != eib_addrs.end()) {
-            JsonBuilder resp;
-            resp.start_object();
-            resp.add_key("d");
-            resp.start_object();
-            auto cv_addr = KnxAddress{"KNX", KnxGroupAddress::from_eibaddr(recv_addr)};
-            resp.add_string(cv_addr.to_cometvisu(), hex_encode(apdu_data.data(), apdu_data.size()));
-            resp.end_object();
-            resp.add_string("i", generate_index());
-            resp.end_object();
-            result.body = resp.take();
-            return result;
-          }
-        }
+    // Process all changed addresses
+    for (auto changed_addr : updates->changed_addresses) {
+      // Only include subscribed addresses, and deduplicate
+      if (eib_addrs.find(changed_addr) == eib_addrs.end())
+        continue;
+      if (already_written.find(changed_addr) != already_written.end())
+        continue;
+
+      // Read the current value from cache (cache_read filters out Read APDUs)
+      auto data = knxd_.cache_read(changed_addr, true);  // nowait
+      if (data) {
+        json.add_string(addr_key(changed_addr), hex_encode(data->data(), data->size()));
+        already_written.insert(changed_addr);
+        written = true;
       }
     }
 
-    // Long-poll timeout: return empty
-    JsonBuilder resp;
-    resp.start_object();
-    resp.add_key("d");
-    resp.start_object();
-    resp.end_object();
-    resp.add_string("i", generate_index());
-    resp.end_object();
-    result.body = resp.take();
-    return result;
+    if (written)
+      break;
+
+    // Guard against busy-loop: if no progress was made (position didn't
+    // advance and no changes found), knxd's internal timeout (~1s) expired
+    // with no updates. Continue polling — don't sleep-and-break, because
+    // a telegram could arrive at any moment. The outer while loop handles
+    // the overall timeout via elapsed/remaining calculation.
+    if (lastpos == prev_lastpos && updates->changed_addresses.empty()) {
+      // knxd returns "no updates" after its internal ~1s timeout.
+      // Just continue the poll loop — the next cache_last_updates_2
+      // call will either return new updates or time out again.
+      continue;
+    }
+
+    // Guard against busy-loop on a busy bus: if the position advanced due
+    // to telegrams for non-subscribed addresses, cache_last_updates_2
+    // returns immediately on every call, causing a tight CPU-spinning loop.
+    // A brief pause lets the bus settle and keeps us responsive.
+    if (lastpos != prev_lastpos && !updates->changed_addresses.empty()) {
+      // Position advanced but our addresses didn't change.
+      // Sleep briefly to avoid CPU spinning, then continue polling
+      // with the updated position.
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
   }
 
-  // Should never reach here, but be defensive.
-  result.body = "{}";
+  json.end_object();  // d
+  json.add_string("i", std::to_string(lastpos));
+  json.end_object();  // root
+
+  result.body = json.take();
   return result;
 }
 

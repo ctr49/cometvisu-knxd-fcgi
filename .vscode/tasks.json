@@ -202,6 +202,76 @@
       "dependsOrder": "sequence",
       "problemMatcher": [],
       "detail": "Build the project, then start knxd with IP Routing (no hardware needed)"
+    },
+    // ============================================================
+    // Run tasks (no debugger — use these to run the app standalone)
+    // ============================================================
+    {
+      "label": "Run against real knxd",
+      "type": "shell",
+      "command": "${workspaceFolder}/build/src/cometvisu-knxd-fcgi",
+      "isBackground": true,
+      "dependsOn": [
+        "cmake-build-main"
+      ],
+      "options": {
+        "env": {
+          "FCGI_SOCKET": ":9000",
+          "DEBUG_BACKEND": "1",
+          "KNXD_SOCKET": "/run/knx",
+          "LONGPOLL_TIMEOUT_SEC": "300"
+        }
+      },
+      "problemMatcher": {
+        "pattern": [
+          {
+            "regexp": "^\\[INFO\\] Direct FCGI socket: (.+)$",
+            "kind": "file",
+            "file": 1,
+            "message": 1
+          }
+        ],
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^\\[INFO\\] cometvisu-knxd-fcgi starting",
+          "endsPattern": "^\\[INFO\\] Direct FCGI socket:"
+        }
+      },
+      "detail": "Run the FCGI backend against a real knxd instance (no debugger)"
+    },
+    {
+      "label": "Run with local knxd (E2E)",
+      "type": "shell",
+      "command": "${workspaceFolder}/build/src/cometvisu-knxd-fcgi",
+      "isBackground": true,
+      "dependsOn": [
+        "build-and-start-knxd-ipt"
+      ],
+      "dependsOrder": "sequence",
+      "options": {
+        "env": {
+          "FCGI_SOCKET": ":9000",
+          "DEBUG_BACKEND": "1",
+          "KNXD_SOCKET": "/tmp/knxd-ipt",
+          "LONGPOLL_TIMEOUT_SEC": "300"
+        }
+      },
+      "problemMatcher": {
+        "pattern": [
+          {
+            "regexp": "^\\[INFO\\] Direct FCGI socket: (.+)$",
+            "kind": "file",
+            "file": 1,
+            "message": 1
+          }
+        ],
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^\\[INFO\\] cometvisu-knxd-fcgi starting",
+          "endsPattern": "^\\[INFO\\] Direct FCGI socket:"
+        }
+      },
+      "detail": "Run the FCGI backend against a local knxd instance (no debugger, no hardware needed)"
     }
   ],
   "inputs": [

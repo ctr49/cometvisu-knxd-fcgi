@@ -38,7 +38,7 @@ TEST(MockKnxdClientTest, ConnectFailure) {
 
 TEST(MockKnxdClientTest, OpenGroupSocket) {
   MockKnxdClient client;
-  client.connect("/run/knx");
+  ASSERT_TRUE(client.connect("/run/knx"));
   EXPECT_TRUE(client.open_group_socket(false));
 }
 
@@ -49,8 +49,8 @@ TEST(MockKnxdClientTest, OpenGroupSocketNotConnected) {
 
 TEST(MockKnxdClientTest, SendGroupPacket) {
   MockKnxdClient client;
-  client.connect("/run/knx");
-  client.open_group_socket(false);
+  ASSERT_TRUE(client.connect("/run/knx"));
+  ASSERT_TRUE(client.open_group_socket(false));
 
   std::vector<uint8_t> apdu = {0x00, 0x80, 0x0C, 0x6F};
   EXPECT_TRUE(client.send_group_packet(0x0A03, apdu));
@@ -70,7 +70,7 @@ TEST(MockKnxdClientTest, SendGroupPacketNotConnected) {
 
 TEST(MockKnxdClientTest, CacheRead) {
   MockKnxdClient client;
-  client.connect("/run/knx");
+  ASSERT_TRUE(client.connect("/run/knx"));
 
   std::vector<uint8_t> expected = {0x0C, 0x6F};
   client.set_cached_value(0x0A03, expected);
@@ -82,7 +82,7 @@ TEST(MockKnxdClientTest, CacheRead) {
 
 TEST(MockKnxdClientTest, CacheReadMiss) {
   MockKnxdClient client;
-  client.connect("/run/knx");
+  ASSERT_TRUE(client.connect("/run/knx"));
 
   auto result = client.cache_read(0xFFFF, false);
   EXPECT_FALSE(result.has_value());
@@ -90,7 +90,7 @@ TEST(MockKnxdClientTest, CacheReadMiss) {
 
 TEST(MockKnxdClientTest, PollTelegram) {
   MockKnxdClient client;
-  client.connect("/run/knx");
+  ASSERT_TRUE(client.connect("/run/knx"));
 
   client.enqueue_telegram(0x0A03, {0x00, 0x80, 0x42});
 
@@ -109,7 +109,7 @@ TEST(MockKnxdClientTest, PollTelegram) {
 
 TEST(MockKnxdClientTest, Disconnect) {
   MockKnxdClient client;
-  client.connect("/run/knx");
+  ASSERT_TRUE(client.connect("/run/knx"));
   EXPECT_TRUE(client.is_connected());
   client.disconnect();
   EXPECT_FALSE(client.is_connected());
@@ -118,7 +118,7 @@ TEST(MockKnxdClientTest, Disconnect) {
 
 TEST(MockKnxdClientTest, Reset) {
   MockKnxdClient client;
-  client.connect("/run/knx");
+  ASSERT_TRUE(client.connect("/run/knx"));
   client.set_cached_value(0x0A03, {0x42});
   client.enqueue_telegram(0x0A03, {0x00, 0x80});
 
@@ -184,4 +184,113 @@ TEST(MockKnxdClientTest, OperationsWorkAfterReconnect) {
   std::vector<uint8_t> apdu;
   EXPECT_TRUE(client.poll_group_telegram(addr, apdu));
   EXPECT_EQ(addr, 0x0B04);
+}
+
+TEST(MockKnxdClientTest, SendGroupPacketWorksAfterReconnect) {
+  MockKnxdClient client;
+  ASSERT_TRUE(client.connect("/run/knx"));
+  ASSERT_TRUE(client.open_group_socket(false));
+
+  // Disconnect and reconnect
+  client.disconnect();
+  ASSERT_TRUE(client.reconnect());
+  ASSERT_TRUE(client.open_group_socket(false));
+
+  // send_group_packet should work after reconnect
+  std::vector<uint8_t> apdu = {0x00, 0x80, 0x42};
+  EXPECT_TRUE(client.send_group_packet(0x0A03, apdu));
+  EXPECT_EQ(client.sent_packets().size(), 1);
+}
+
+TEST(MockKnxdClientTest, CacheReadWorksAfterReconnect) {
+  MockKnxdClient client;
+  ASSERT_TRUE(client.connect("/run/knx"));
+  ASSERT_TRUE(client.open_group_socket(false));
+
+  client.set_cached_value(0x0A03, {0x42});
+
+  // Disconnect and reconnect
+  client.disconnect();
+  ASSERT_TRUE(client.reconnect());
+
+  // cache_read should still find the cached value
+  auto val = client.cache_read(0x0A03, false);
+  ASSERT_TRUE(val.has_value());
+  EXPECT_EQ(*val, (std::vector<uint8_t>{0x42}));
+}
+
+TEST(MockKnxdClientTest, CacheLastUpdatesWorksAfterReconnect) {
+  MockKnxdClient client;
+  ASSERT_TRUE(client.connect("/run/knx"));
+  ASSERT_TRUE(client.open_group_socket(false));
+
+  // Disconnect and reconnect
+  client.disconnect();
+  ASSERT_TRUE(client.reconnect());
+
+  // cache_last_updates_2 should work after reconnect
+  client.set_last_updates_result(0, {0x0A03}, 10);
+  auto result = client.cache_last_updates_2(0, 5);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->new_position, 10);
+  ASSERT_EQ(result->changed_addresses.size(), 1);
+  EXPECT_EQ(result->changed_addresses[0], 0x0A03);
+}
+
+TEST(MockKnxdClientTest, CacheReadReturnsNulloptWhenDisconnected) {
+  MockKnxdClient client;
+  ASSERT_TRUE(client.connect("/run/knx"));
+  client.set_cached_value(0x0A03, {0x42});
+
+  client.disconnect();
+  // cache_read should return nullopt when disconnected (no auto-reconnect in mock)
+  EXPECT_FALSE(client.cache_read(0x0A03, false).has_value());
+}
+
+TEST(MockKnxdClientTest, CacheLastUpdatesReturnsNulloptWhenDisconnected) {
+  MockKnxdClient client;
+  ASSERT_TRUE(client.connect("/run/knx"));
+  client.set_last_updates_result(0, {0x0A03}, 10);
+
+  client.disconnect();
+  EXPECT_FALSE(client.cache_last_updates_2(0, 5).has_value());
+}
+
+TEST(MockKnxdClientTest, CacheReadFailCount) {
+  MockKnxdClient client;
+  ASSERT_TRUE(client.connect("/run/knx"));
+  client.set_cached_value(0x0A03, {0x42});
+
+  // Set fail count: first call returns nullopt, second succeeds
+  client.set_cache_read_fail_count(1);
+
+  // First call fails (also simulates connection drop)
+  EXPECT_FALSE(client.cache_read(0x0A03, false).has_value());
+  // Reconnect after simulated failure (as handlers do)
+  ASSERT_TRUE(client.reconnect());
+  // Second call succeeds
+  auto val = client.cache_read(0x0A03, false);
+  ASSERT_TRUE(val.has_value());
+  EXPECT_EQ(*val, (std::vector<uint8_t>{0x42}));
+  // Third call also succeeds (fail count exhausted)
+  val = client.cache_read(0x0A03, false);
+  ASSERT_TRUE(val.has_value());
+}
+
+TEST(MockKnxdClientTest, CacheLastUpdatesFailCount) {
+  MockKnxdClient client;
+  ASSERT_TRUE(client.connect("/run/knx"));
+  client.set_last_updates_result(0, {0x0A03}, 10);
+
+  // Set fail count: first call returns nullopt, second succeeds
+  client.set_cache_last_updates_fail_count(1);
+
+  // First call fails (also simulates connection drop)
+  EXPECT_FALSE(client.cache_last_updates_2(0, 5).has_value());
+  // Reconnect after simulated failure (as handlers do)
+  ASSERT_TRUE(client.reconnect());
+  // Second call succeeds
+  auto result = client.cache_last_updates_2(0, 5);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->new_position, 10);
 }

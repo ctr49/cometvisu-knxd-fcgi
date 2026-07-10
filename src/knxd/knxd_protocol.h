@@ -95,6 +95,8 @@ inline constexpr uint16_t APDU_PACKET = EIB_APDU_PACKET;
 inline constexpr uint16_t OPEN_T_GROUP = EIB_OPEN_T_GROUP;
 inline constexpr uint16_t CACHE_READ = EIB_CACHE_READ;
 inline constexpr uint16_t CACHE_READ_NOWAIT = EIB_CACHE_READ_NOWAIT;
+inline constexpr uint16_t CACHE_LAST_UPDATES = EIB_CACHE_LAST_UPDATES;
+inline constexpr uint16_t CACHE_LAST_UPDATES_2 = EIB_CACHE_LAST_UPDATES_2;
 }  // namespace EibMessageType
 
 /// Build a complete eibd wire message.
@@ -130,6 +132,29 @@ inline constexpr uint16_t CACHE_READ_NOWAIT = EIB_CACHE_READ_NOWAIT;
 /// @param group_addr 16-bit EIB group address to read from cache (non-blocking).
 /// @return Complete wire-format message ready to send.
 [[nodiscard]] std::vector<uint8_t> build_cache_read_nowait(uint16_t group_addr);
+
+/// Build an EIB_CACHE_LAST_UPDATES_2 wire message.
+/// Payload: [type:2][start:4][timeout:2].
+/// Uses 32-bit position counters (unlike v1 which uses 16-bit).
+/// @param start The starting position (only updates after this are returned).
+/// @param timeout_sec How long to wait for updates (seconds, 0 = return immediately).
+/// @return Complete wire-format message ready to send.
+[[nodiscard]] std::vector<uint8_t> build_cache_last_updates_2(uint32_t start, int timeout_sec);
+
+/// Result of a CACHE_LAST_UPDATES_2 response.
+struct LastUpdatesResult {
+  /// Group addresses that changed since the start position.
+  std::vector<uint16_t> changed_addresses;
+  /// New end position (pass this as "start" in the next call).
+  uint32_t new_position;
+};
+
+/// Parse an EIB_CACHE_LAST_UPDATES_2 response.
+/// Response payload: [end:4][addrs:N*2]
+/// @param data Raw payload data (after the 2-byte type).
+/// @return Parsed result, or std::nullopt if the data is malformed.
+[[nodiscard]] std::optional<LastUpdatesResult> parse_cache_last_updates_2_response(
+    const std::vector<uint8_t>& data);
 
 /// Parse a received eibd wire message.
 /// @param raw Raw bytes received from socket.
