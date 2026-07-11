@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -365,12 +366,16 @@ TEST_F(ConcurrentClientsTest, MultipleClientsProcessedConcurrently) {
     return resp;
   });
 
-  // Start server in multithreaded mode in a background thread
+  // Start server in multithreaded mode in a background thread.
+  // Use std::promise/future so we can wait with a timeout — blocking
+  // join() would hang CI forever if shutdown doesn't unblock workers.
+  std::promise<int> server_promise;
+  auto server_future = server_promise.get_future();
   std::atomic<bool> server_ready{false};
-  std::atomic<int> server_result{0};
   std::thread server_thread([&]() {
     server_ready.store(true);
-    server_result.store(server.run_multithreaded(kNumThreads));
+    int result = server.run_multithreaded(kNumThreads);
+    server_promise.set_value(result);
   });
 
   // Wait for server to be ready
@@ -435,27 +440,21 @@ TEST_F(ConcurrentClientsTest, MultipleClientsProcessedConcurrently) {
                            << "(expected < 400ms with concurrent threads)";
 
   // Shutdown: unblock the accept loops and wait for workers.
-  // The watchdog prevents CI hangs: if shutdown+join takes > 10s, fail.
   server.shutdown();
 
-  // Join with a watchdog thread — if the server thread hasn't exited
-  // within 10 seconds, the test fails with a clear message instead of
-  // hanging CI indefinitely.
-  std::atomic<bool> server_joined{false};
-  std::thread watchdog([&]() {
-    std::this_thread::sleep_for(std::chrono::seconds(10));
-    if (!server_joined.load()) {
-      // Server thread is stuck — report failure. We can't use FAIL()
-      // from a non-GTest thread, but the test will time out in CI anyway.
-      // The socket timeout on clients already ensures we got here.
-      std::cerr << "[TEST] WARNING: server_thread.join() is taking > 10s\n";
-    }
-  });
-  watchdog.detach();
-
-  server_thread.join();
-  server_joined.store(true);
-
-  // Sanity: the server should shut down cleanly
-  EXPECT_EQ(server_result.load(), 0) << "server.run_multithreaded() returned error";
+  // Wait for the server thread with a firm 15-second timeout.
+  // If shutdown() works correctly, this returns in < 1 second.
+  // If workers are stuck in accept(), the future times out and we
+  // detach the thread — the test reports failure instead of hanging CI.
+  auto status = server_future.wait_for(std::chrono::seconds(15));
+  if (status == std::future_status::timeout) {
+    server_thread.detach();
+    FAIL() << "Server thread did not exit within 15 seconds after shutdown(). "
+           << "Workers likely stuck in accept() — shutdown(listen_fd, SHUT_RDWR) "
+           << "may not be supported on this platform.";
+  } else {
+    server_thread.join();
+    int result = server_future.get();
+    EXPECT_EQ(result, 0) << "server.run_multithreaded() returned error";
+  }
 }

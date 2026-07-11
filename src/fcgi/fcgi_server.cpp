@@ -133,9 +133,14 @@ void FcgiServer::shutdown() {
   shutdown_requested_.store(true, std::memory_order_relaxed);
 
   if (listen_fd_ >= 0) {
-    // Unblock worker threads waiting in accept() by connecting to our own
-    // listen socket. Use non-blocking connect to avoid blocking when the
-    // backlog is full. We need one connection per worker thread.
+    // Step 1: shutdown(SHUT_RDWR) causes any thread blocked in accept()
+    // on this fd to fail with EINVAL. This is reliable on Linux, unlike
+    // close() which may leave accept() blocked indefinitely.
+    ::shutdown(listen_fd_, SHUT_RDWR);
+
+    // Step 2: Connect to unblock any workers that didn't respond to
+    // shutdown(). Each accepted connection gets an immediate client EOF,
+    // causing FCGX_Accept_r to return -1 and the worker to exit.
     struct sockaddr_un addr;
     socklen_t addr_len = sizeof(addr);
     if (::getsockname(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), &addr_len) == 0) {
@@ -148,7 +153,6 @@ void FcgiServer::shutdown() {
         if (ret == 0 || errno == EINPROGRESS) {
           // Connection queued — one worker will accept it
         } else {
-          // Connection refused — no more workers waiting
           ::close(fd);
           break;
         }
@@ -156,6 +160,7 @@ void FcgiServer::shutdown() {
       }
     }
 
+    // Step 3: Close the fd. By now all workers should have exited.
     ::close(listen_fd_);
     listen_fd_ = -1;
   }
